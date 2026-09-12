@@ -53,6 +53,18 @@ impl ModuleCache {
             .ok()
     }
 
+    pub fn remove_module_if_binary_matches(&mut self, key: &ModuleKey, binary: &[u8]) {
+        diesel::delete(modules::dsl::modules)
+            .filter(modules::hash.eq(key.hash.as_str()))
+            .filter(modules::compiler_version.eq(&key.compiler_version))
+            .filter(modules::zluda_version.eq(key.zluda_version))
+            .filter(modules::device.eq(key.device))
+            .filter(modules::backend_key.eq(&key.backend_key))
+            .filter(modules::binary.eq(binary))
+            .execute(&mut self.0)
+            .ok();
+    }
+
     pub fn insert_module(&mut self, key: &ModuleKey, binary: &[u8]) {
         diesel::insert_into(modules::dsl::modules)
             .values(models::AddModule {
@@ -194,6 +206,102 @@ mod tests {
         let all_globals = globals.select(Global::as_select()).load(&mut db.0).unwrap();
         assert_eq!(all_globals[0].key, "total_size");
         assert_eq!(all_globals[0].value, 5);
+    }
+
+    #[test]
+    fn remove_module_requires_exact_key_and_binary() {
+        let mut db = ModuleCache::open(":memory:").unwrap();
+        let module_key = super::ModuleKey {
+            hash: ArrayString::from("test_hash").unwrap(),
+            compiler_version: "1.0.0",
+            zluda_version: "1.0.0",
+            device: "test_device",
+            backend_key: "{}".to_string(),
+            last_access: 123,
+        };
+        let expected_binary = &[1, 2, 3];
+        db.insert_module(&module_key, expected_binary);
+
+        let mismatched_keys = vec![
+            super::ModuleKey {
+                hash: ArrayString::from("other_hash").unwrap(),
+                compiler_version: "1.0.0",
+                zluda_version: "1.0.0",
+                device: "test_device",
+                backend_key: "{}".to_string(),
+                last_access: 123,
+            },
+            super::ModuleKey {
+                hash: ArrayString::from("test_hash").unwrap(),
+                compiler_version: "2.0.0",
+                zluda_version: "1.0.0",
+                device: "test_device",
+                backend_key: "{}".to_string(),
+                last_access: 123,
+            },
+            super::ModuleKey {
+                hash: ArrayString::from("test_hash").unwrap(),
+                compiler_version: "1.0.0",
+                zluda_version: "2.0.0",
+                device: "test_device",
+                backend_key: "{}".to_string(),
+                last_access: 123,
+            },
+            super::ModuleKey {
+                hash: ArrayString::from("test_hash").unwrap(),
+                compiler_version: "1.0.0",
+                zluda_version: "1.0.0",
+                device: "other_device",
+                backend_key: "{}".to_string(),
+                last_access: 123,
+            },
+            super::ModuleKey {
+                hash: ArrayString::from("test_hash").unwrap(),
+                compiler_version: "1.0.0",
+                zluda_version: "1.0.0",
+                device: "test_device",
+                backend_key: "{\"other\":true}".to_string(),
+                last_access: 123,
+            },
+        ];
+        for mismatched_key in mismatched_keys {
+            db.remove_module_if_binary_matches(&mismatched_key, expected_binary);
+            let rows = modules.select(Module::as_select()).load(&mut db.0).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].binary, expected_binary);
+            assert_eq!(rows[0].last_access, 123);
+        }
+
+        db.remove_module_if_binary_matches(&module_key, expected_binary);
+        assert!(modules
+            .select(Module::as_select())
+            .load(&mut db.0)
+            .unwrap()
+            .is_empty());
+        let all_globals = globals.select(Global::as_select()).load(&mut db.0).unwrap();
+        assert_eq!(all_globals[0].value, 0);
+
+        let replacement = [6, 7, 8, 9];
+        let replacement_key = super::ModuleKey {
+            hash: ArrayString::from("test_hash").unwrap(),
+            compiler_version: "1.0.0",
+            zluda_version: "1.0.0",
+            device: "test_device",
+            backend_key: "{}".to_string(),
+            last_access: 200,
+        };
+        db.insert_module(&replacement_key, &replacement);
+        db.remove_module_if_binary_matches(&replacement_key, expected_binary);
+        let rows = modules.select(Module::as_select()).load(&mut db.0).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].binary, replacement);
+        assert_eq!(rows[0].last_access, 200);
+        let all_globals = globals.select(Global::as_select()).load(&mut db.0).unwrap();
+        assert_eq!(all_globals[0].value, 4);
+
+        db.remove_module_if_binary_matches(&replacement_key, &replacement);
+        let all_globals = globals.select(Global::as_select()).load(&mut db.0).unwrap();
+        assert_eq!(all_globals[0].value, 0);
     }
 
     #[test]

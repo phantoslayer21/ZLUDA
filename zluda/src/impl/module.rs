@@ -320,12 +320,88 @@ fn load_cached_binary(
     let binary = cache_with_key
         .as_mut()
         .and_then(|(c, key)| c.get_module_binary(key))?;
-    let sm_version = kernel_metadata::ModuleMetadataV1::read_object(&binary)?
-        .sm_version
-        .to_native();
+    let sm_version = match kernel_metadata::ModuleMetadataV1::read_object(&binary) {
+        Some(metadata) => metadata.sm_version.to_native(),
+        None => {
+            if let Some((cache, key)) = cache_with_key.as_mut() {
+                cache.remove_module_if_binary_matches(key, &binary);
+            }
+            return None;
+        }
+    };
     let zluda32 = kernel_metadata::ModuleMetadata32Bit::read_object(&binary)
         .map(Metadata32Bit::from_archived);
     Some((binary, sm_version, zluda32))
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::load_cached_binary;
+
+    fn cache_entry() -> (zluda_cache::ModuleCache, zluda_cache::ModuleKey<'static>) {
+        (
+            zluda_cache::ModuleCache::open(":memory:").unwrap(),
+            zluda_cache::ModuleKey {
+                hash: "test_hash".try_into().unwrap(),
+                compiler_version: "builtin",
+                zluda_version: "test_version",
+                device: "test_device",
+                backend_key: "{}".into(),
+                last_access: 123,
+            },
+        )
+    }
+
+    fn metadata_object() -> Vec<u8> {
+        let mut header = [0u8; 64];
+        header[..4].copy_from_slice(b"\x7fELF");
+        header[4] = 2;
+        header[5] = 1;
+        header[6] = 1;
+        header[16..18].copy_from_slice(&1u16.to_le_bytes());
+        header[18..20].copy_from_slice(&224u16.to_le_bytes());
+        header[20..24].copy_from_slice(&1u32.to_le_bytes());
+        header[52..54].copy_from_slice(&64u16.to_le_bytes());
+        let mut binary = Vec::new();
+        kernel_metadata::ModuleMetadataV1::new(80)
+            .write_object(&header, &mut binary)
+            .unwrap();
+        binary
+    }
+
+    #[test]
+    fn rejected_metadata_can_be_replaced() {
+        let (mut cache, key) = cache_entry();
+        cache.insert_module(&key, b"not an ELF object");
+        let mut entry = Some((cache, key));
+        assert!(load_cached_binary(&mut entry).is_none());
+        let (cache, key) = entry.as_mut().unwrap();
+        assert!(cache.get_module_binary(key).is_none());
+        let replacement = metadata_object();
+        cache.insert_module(key, &replacement);
+        let (binary, sm_version, metadata32) = load_cached_binary(&mut entry).unwrap();
+        assert_eq!(binary, replacement);
+        assert_eq!(sm_version, 80);
+        assert!(metadata32.is_none());
+        assert!(load_cached_binary(&mut entry).is_some());
+    }
+
+    #[test]
+    fn valid_cached_metadata_is_preserved() {
+        let (mut cache, key) = cache_entry();
+        let binary = metadata_object();
+        cache.insert_module(&key, &binary);
+        let mut entry = Some((cache, key));
+        assert_eq!(load_cached_binary(&mut entry).unwrap().0, binary);
+        let (cache, key) = entry.as_mut().unwrap();
+        assert_eq!(cache.get_module_binary(key), Some(binary));
+    }
+
+    #[test]
+    fn missing_cache_or_entry_is_a_miss() {
+        assert!(load_cached_binary(&mut None).is_none());
+        assert!(load_cached_binary(&mut Some(cache_entry())).is_none());
+    }
 }
 
 fn compile_and_cache(
